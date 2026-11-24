@@ -23,13 +23,16 @@ Build an end-to-end MLOps pipeline to predict household electricity consumption 
 
 ```text
 .
+├── .dockerignore
 ├── .dvc/
 ├── .dvcignore
 ├── .gitignore
+├── Dockerfile
 ├── README.md
 ├── mlflow.db
 ├── mlruns/
 ├── params.yaml
+├── requirements-api.txt
 ├── requirements.txt
 ├── data/
 │   └── raw/
@@ -55,6 +58,7 @@ Build an end-to-end MLOps pipeline to predict household electricity consumption 
 ├── src/
 │   └── mp008/
 │       ├── __init__.py
+│       ├── api.py
 │       ├── cleaning.py
 │       ├── data_checks.py
 │       ├── evaluation.py
@@ -63,6 +67,7 @@ Build an end-to-end MLOps pipeline to predict household electricity consumption 
 │       ├── preprocessing.py
 │       └── training.py
 └── tests/
+    ├── test_api.py
     ├── test_mlflow.py
     ├── test_predictions.py
     └── test_training.py
@@ -181,49 +186,146 @@ This writes `predictions/holdout_predictions.csv` containing exact columns `reco
 
 ## 8. Running automated tests
 
-Run the automated test suite with `pytest`:
+Run the full automated test suite (Phase 2 + Phase 3 API tests) with `pytest`:
 
 ```powershell
 python -m pytest -v
 ```
 
-
-## 9. Prediction API, logging, CI and Kubernetes
-
-### Prediction API (`app/main.py`)
-
-- `GET /health` returns `{"status": "ok", "model_loaded": true}`.
-- `POST /predict` takes exactly these fields: `rooms`, `members`, `ac_hours_per_day`, `avg_temp_c`, `house_area_sqft`, `solar_kw`, `connection`, `feeder`, and returns `predicted_units_kwh`.
-- The client's two rules are enforced in the pydantic schema, so a bad request gets status 422 and never reaches the model:
-  - `solar_kw` must be at most 9.
-  - `house_area_sqft` must be at least 150.
-
-Run locally:
+Run only the Phase 3 FastAPI `TestClient` suite:
 
 ```powershell
-python -m uvicorn app.main:app --port 8000
+python -m pytest tests/test_api.py -v
 ```
 
-### JSON logging (`app/logging_config.py`)
+## 9. Phase 3: FastAPI Prediction Service & Docker Deployment
 
-Every prediction writes one JSON line to stdout (never to a file), with the timestamp, level, feeder, predicted value and latency. No personal details are logged.
+### API Architecture
 
-### Docker
+- **Module:** `src/mp008/api.py` (`uvicorn src.mp008.api:app`)
+- **Model Artifact:** Loads `models/model.joblib` relative to the project root (independent of current working directory).
+- **Preprocessing Consistency:** Applies `clean_inference_data()` from `src/mp008/cleaning.py` before passing the 8 approved features in exact training order to the scikit-learn pipeline.
+- **Non-Negative Guard:** Clips predictions at `0.0` kWh (`max(0.0, raw_prediction)`).
+- **Structured JSON Logging:** Emits single-line JSON log events to `stdout` (`timestamp`, `level`, `event`, `request_id`, `duration_ms`) for startup, shutdown, successful predictions, validation failures, and errors without logging full payloads.
+
+### Endpoints
+
+#### `GET /health`
+- **Status:** `200 OK`
+- **Response:**
+```json
+{"status": "ok"}
+```
+
+#### `POST /predict`
+Accepts the 8 approved prediction features (`record_id`, `date`, `billed_units_after_reading`, and `units_kwh` are not accepted):
+
+| Field | Type | Validation Rules |
+|---|---|---|
+| `rooms` | `int` | Required, strict integer, `> 0` |
+| `members` | `int` | Required, strict integer, `> 0` |
+| `ac_hours_per_day` | `float` | Required, finite number, `0 <= ac_hours_per_day <= 24` |
+| `avg_temp_c` | `float` | Required, finite number |
+| `house_area_sqft` | `float` | Required, finite number, `house_area_sqft >= 150` (**values `< 150` return HTTP 422**) |
+| `solar_kw` | `float` | Required, finite number, `0 <= solar_kw <= 9` (**values `> 9` return HTTP 422**) |
+| `connection` | `str` | Required, non-empty string |
+| `feeder` | `str` | Required, non-empty string |
+
+Unexpected extra fields and non-numeric types (such as strings or booleans for numerical fields) are rejected with **HTTP 422**.
+
+#### Example Valid Request
+
+```json
+{
+  "rooms": 4,
+  "members": 5,
+  "ac_hours_per_day": 6.5,
+  "avg_temp_c": 31.2,
+  "house_area_sqft": 1800.0,
+  "solar_kw": 3.5,
+  "connection": "domestic_plus",
+  "feeder": "Feeder-2"
+}
+```
+
+#### Example Prediction Response (`200 OK`)
+
+```json
+{
+  "prediction": 442.19,
+  "predicted_units_kwh": 442.19,
+  "unit": "kWh"
+}
+```
+
+### Running the API Locally
+
+From the repository root in Windows PowerShell:
+
+```powershell
+python -m uvicorn src.mp008.api:app --host 0.0.0.0 --port 8000
+```
+
+Verify endpoints in another PowerShell window:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8000/health" -Method Get
+
+$body = '{"rooms":4,"members":5,"ac_hours_per_day":6.5,"avg_temp_c":31.2,"house_area_sqft":1800.0,"solar_kw":3.5,"connection":"domestic_plus","feeder":"Feeder-2"}'
+Invoke-RestMethod -Uri "http://localhost:8000/predict" -Method Post -ContentType "application/json" -Body $body
+```
+
+### Docker Build & Run
+
+The `Dockerfile` uses `python:3.12-slim`, installs the lean serving dependencies from `requirements-api.txt` (omitting training/tracking-only packages such as MLflow, PyArrow, and Matplotlib while keeping `PyYAML`, `scikit-learn`, `pandas`, `numpy`, `scipy`, `joblib`, `fastapi`, `uvicorn`, and `pydantic` at exact pinned versions matching `requirements.txt`) prior to copying `src/`, `models/model.joblib`, and `params.yaml`, exposes port `8000`, and starts `uvicorn src.mp008.api:app --host 0.0.0.0 --port 8000`.
+
+Build the container image:
 
 ```powershell
 docker build -t mp008-api:1.0 .
-docker run -p 8000:8000 mp008-api:1.0
 ```
 
-### Continuous integration (`.github/workflows/ci.yml`)
+Run the container:
 
-On every push, GitHub Actions installs `requirements.txt` and runs `pytest`. The API tests (`tests/test_api.py`) use FastAPI's `TestClient` with a stub model, so they need no data files.
+```powershell
+docker run --rm -p 8000:8000 mp008-api:1.0
+```
+## 10. Continuous Integration and Kubernetes Deployment
 
-### Kubernetes (`k8s/`)
+### GitHub Actions CI
 
-- `deployment.yaml`: Deployment `mp008-api`, 2 replicas, image `mp008-api:1.0`, container port 8000. Readiness and liveness probes both call `/health`, and liveness waits longer (20 s against 5 s).
-- `service.yaml`: Service `mp008-svc`, port 80 forwarding to container port 8000. Its selector matches the Pod label `app: mp008-api`.
+The GitHub Actions workflow is located at `.github/workflows/ci.yml`.
+
+It runs automatically on pushes and pull requests. The workflow:
+1. Checks out the repository.
+2. Sets up Python 3.12.
+3. Installs dependencies from `requirements.txt`.
+4. Runs the complete automated test suite using `pytest`.
+
+### Kubernetes Deployment
+
+The Kubernetes configuration is located in the `k8s/` directory.
+
+- `k8s/deployment.yaml`: Creates the `mp008-api` Deployment with 2 replicas, using image `mp008-api:1.0` and container port 8000.
+- `k8s/service.yaml`: Creates the `mp008-svc` ClusterIP Service, exposing port 80 and forwarding traffic to port 8000.
+- Readiness and liveness probes use the `/health` endpoint. The liveness probe has a longer initial delay.
+
+Apply the Kubernetes configuration:
 
 ```powershell
 kubectl apply -f k8s/
+```
+
+Check deployment status:
+
+```powershell
+kubectl get deployments
+kubectl get pods
+kubectl get services
+```
+
+The health endpoint returns exactly:
+
+```json
+{"status": "ok"}
 ```
