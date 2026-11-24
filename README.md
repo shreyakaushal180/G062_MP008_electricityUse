@@ -290,3 +290,42 @@ Run the container:
 ```powershell
 docker run --rm -p 8000:8000 mp008-api:1.0
 ```
+## 10. Continuous Integration and Kubernetes Deployment
+
+### GitHub Actions CI
+
+The GitHub Actions workflow is located at `.github/workflows/ci.yml`.
+
+It runs automatically on pushes and pull requests. The workflow:
+1. Checks out the repository.
+2. Sets up Python 3.12.
+3. Installs dependencies from `requirements.txt`.
+4. Runs the complete automated test suite using `pytest`.
+
+### Kubernetes Deployment
+
+The Kubernetes configuration is located in the `k8s/` directory.
+
+- `k8s/deployment.yaml`: Creates the `mp008-api` Deployment with 2 replicas, using image `mp008-api:1.0` and container port 8000.
+- `k8s/service.yaml`: Creates the `mp008-svc` ClusterIP Service, exposing port 80 and forwarding traffic to port 8000.
+- Readiness and liveness probes use the `/health` endpoint. The liveness probe has a longer initial delay.
+
+Apply the Kubernetes configuration:
+
+```powershell
+kubectl apply -f k8s/
+```
+
+Check deployment status:
+
+```powershell
+kubectl get deployments
+kubectl get pods
+kubectl get services
+```
+
+The health endpoint returns exactly:
+
+```json
+{"status": "ok"}
+```
