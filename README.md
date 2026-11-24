@@ -23,13 +23,16 @@ Build an end-to-end MLOps pipeline to predict household electricity consumption 
 
 ```text
 .
+├── .dockerignore
 ├── .dvc/
 ├── .dvcignore
 ├── .gitignore
+├── Dockerfile
 ├── README.md
 ├── mlflow.db
 ├── mlruns/
 ├── params.yaml
+├── requirements-api.txt
 ├── requirements.txt
 ├── data/
 │   └── raw/
@@ -55,6 +58,7 @@ Build an end-to-end MLOps pipeline to predict household electricity consumption 
 ├── src/
 │   └── mp008/
 │       ├── __init__.py
+│       ├── api.py
 │       ├── cleaning.py
 │       ├── data_checks.py
 │       ├── evaluation.py
@@ -63,6 +67,7 @@ Build an end-to-end MLOps pipeline to predict household electricity consumption 
 │       ├── preprocessing.py
 │       └── training.py
 └── tests/
+    ├── test_api.py
     ├── test_mlflow.py
     ├── test_predictions.py
     └── test_training.py
@@ -181,8 +186,107 @@ This writes `predictions/holdout_predictions.csv` containing exact columns `reco
 
 ## 8. Running automated tests
 
-Run the automated test suite with `pytest`:
+Run the full automated test suite (Phase 2 + Phase 3 API tests) with `pytest`:
 
 ```powershell
 python -m pytest -v
+```
+
+Run only the Phase 3 FastAPI `TestClient` suite:
+
+```powershell
+python -m pytest tests/test_api.py -v
+```
+
+## 9. Phase 3: FastAPI Prediction Service & Docker Deployment
+
+### API Architecture
+
+- **Module:** `src/mp008/api.py` (`uvicorn src.mp008.api:app`)
+- **Model Artifact:** Loads `models/model.joblib` relative to the project root (independent of current working directory).
+- **Preprocessing Consistency:** Applies `clean_inference_data()` from `src/mp008/cleaning.py` before passing the 8 approved features in exact training order to the scikit-learn pipeline.
+- **Non-Negative Guard:** Clips predictions at `0.0` kWh (`max(0.0, raw_prediction)`).
+- **Structured JSON Logging:** Emits single-line JSON log events to `stdout` (`timestamp`, `level`, `event`, `request_id`, `duration_ms`) for startup, shutdown, successful predictions, validation failures, and errors without logging full payloads.
+
+### Endpoints
+
+#### `GET /health`
+- **Status:** `200 OK`
+- **Response:**
+```json
+{"status": "ok"}
+```
+
+#### `POST /predict`
+Accepts the 8 approved prediction features (`record_id`, `date`, `billed_units_after_reading`, and `units_kwh` are not accepted):
+
+| Field | Type | Validation Rules |
+|---|---|---|
+| `rooms` | `int` | Required, strict integer, `> 0` |
+| `members` | `int` | Required, strict integer, `> 0` |
+| `ac_hours_per_day` | `float` | Required, finite number, `0 <= ac_hours_per_day <= 24` |
+| `avg_temp_c` | `float` | Required, finite number |
+| `house_area_sqft` | `float` | Required, finite number, `house_area_sqft >= 150` (**values `< 150` return HTTP 422**) |
+| `solar_kw` | `float` | Required, finite number, `0 <= solar_kw <= 9` (**values `> 9` return HTTP 422**) |
+| `connection` | `str` | Required, non-empty string |
+| `feeder` | `str` | Required, non-empty string |
+
+Unexpected extra fields and non-numeric types (such as strings or booleans for numerical fields) are rejected with **HTTP 422**.
+
+#### Example Valid Request
+
+```json
+{
+  "rooms": 4,
+  "members": 5,
+  "ac_hours_per_day": 6.5,
+  "avg_temp_c": 31.2,
+  "house_area_sqft": 1800.0,
+  "solar_kw": 3.5,
+  "connection": "domestic_plus",
+  "feeder": "Feeder-2"
+}
+```
+
+#### Example Prediction Response (`200 OK`)
+
+```json
+{
+  "prediction": 442.19,
+  "predicted_units_kwh": 442.19,
+  "unit": "kWh"
+}
+```
+
+### Running the API Locally
+
+From the repository root in Windows PowerShell:
+
+```powershell
+python -m uvicorn src.mp008.api:app --host 0.0.0.0 --port 8000
+```
+
+Verify endpoints in another PowerShell window:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8000/health" -Method Get
+
+$body = '{"rooms":4,"members":5,"ac_hours_per_day":6.5,"avg_temp_c":31.2,"house_area_sqft":1800.0,"solar_kw":3.5,"connection":"domestic_plus","feeder":"Feeder-2"}'
+Invoke-RestMethod -Uri "http://localhost:8000/predict" -Method Post -ContentType "application/json" -Body $body
+```
+
+### Docker Build & Run
+
+The `Dockerfile` uses `python:3.12-slim`, installs the lean serving dependencies from `requirements-api.txt` (omitting training/tracking-only packages such as MLflow, PyArrow, and Matplotlib while keeping `PyYAML`, `scikit-learn`, `pandas`, `numpy`, `scipy`, `joblib`, `fastapi`, `uvicorn`, and `pydantic` at exact pinned versions matching `requirements.txt`) prior to copying `src/`, `models/model.joblib`, and `params.yaml`, exposes port `8000`, and starts `uvicorn src.mp008.api:app --host 0.0.0.0 --port 8000`.
+
+Build the container image:
+
+```powershell
+docker build -t mp008-api:1.0 .
+```
+
+Run the container:
+
+```powershell
+docker run --rm -p 8000:8000 mp008-api:1.0
 ```
