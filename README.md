@@ -186,3 +186,44 @@ Run the automated test suite with `pytest`:
 ```powershell
 python -m pytest -v
 ```
+
+
+## 9. Prediction API, logging, CI and Kubernetes
+
+### Prediction API (`app/main.py`)
+
+- `GET /health` returns `{"status": "ok", "model_loaded": true}`.
+- `POST /predict` takes exactly these fields: `rooms`, `members`, `ac_hours_per_day`, `avg_temp_c`, `house_area_sqft`, `solar_kw`, `connection`, `feeder`, and returns `predicted_units_kwh`.
+- The client's two rules are enforced in the pydantic schema, so a bad request gets status 422 and never reaches the model:
+  - `solar_kw` must be at most 9.
+  - `house_area_sqft` must be at least 150.
+
+Run locally:
+
+```powershell
+python -m uvicorn app.main:app --port 8000
+```
+
+### JSON logging (`app/logging_config.py`)
+
+Every prediction writes one JSON line to stdout (never to a file), with the timestamp, level, feeder, predicted value and latency. No personal details are logged.
+
+### Docker
+
+```powershell
+docker build -t mp008-api:1.0 .
+docker run -p 8000:8000 mp008-api:1.0
+```
+
+### Continuous integration (`.github/workflows/ci.yml`)
+
+On every push, GitHub Actions installs `requirements.txt` and runs `pytest`. The API tests (`tests/test_api.py`) use FastAPI's `TestClient` with a stub model, so they need no data files.
+
+### Kubernetes (`k8s/`)
+
+- `deployment.yaml`: Deployment `mp008-api`, 2 replicas, image `mp008-api:1.0`, container port 8000. Readiness and liveness probes both call `/health`, and liveness waits longer (20 s against 5 s).
+- `service.yaml`: Service `mp008-svc`, port 80 forwarding to container port 8000. Its selector matches the Pod label `app: mp008-api`.
+
+```powershell
+kubectl apply -f k8s/
+```
